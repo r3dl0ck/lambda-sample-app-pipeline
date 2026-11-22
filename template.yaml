@@ -1,0 +1,148 @@
+# Szablon SAM aplikacji wdrazanej przez pipeline (etap Deploy).
+# `aws cloudformation package` (buildspec.yml) zamienia lokalne CodeUri: src/
+# na obiekt S3 i zapisuje wynik jako packaged-template.yaml.
+#
+# AutoPublishAlias + DeploymentPreference sprawiaja, ze przy kazdej zmianie funkcji
+# CloudFormation publikuje nowa wersje i NIE przelacza aliasu "live" od razu, tylko
+# zleca CodeDeploy stopniowe przesuniecie ruchu (canary) z hookiem i alarmem.
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: Przykladowa aplikacja Lambda wdrazana przez CodePipeline i CodeDeploy (canary)
+
+Parameters:
+  AppVersion:
+    Type: String
+    Default: "1.0.0"
+
+Resources:
+  AppFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: workshop-app-function
+      Runtime: python3.12
+      Handler: app.handler
+      CodeUri: src/
+      Environment:
+        Variables:
+          APP_VERSION: !Ref AppVersion
+      AutoPublishAlias: live
+      DeploymentPreference:
+        Type: Canary10Percent5Minutes   # 10% ruchu na nowa wersje, po 5 minutach reszta
+        Alarms:
+          - !Ref CanaryErrorsAlarm      # alarm w stanie ALARM => automatyczny rollback
+        Hooks:
+          PreTraffic: !Ref PreTrafficHook   # walidacja nowej wersji przed przesunieciem ruchu
+
+  # Alarm na bledy NOWEJ wersji wywolywanej przez alias "live".
+  CanaryErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Bledy nowej wersji funkcji podczas wdrozenia canary
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref AppFunction
+        - Name: Resource
+          Value: !Sub "${AppFunction}:live"
+        - Name: ExecutedVersion
+          Value: !GetAtt AppFunction.Version.Version
+
+  # Hook BeforeAllowTraffic. Nazwa MUSI zaczynac sie od CodeDeployHook_ -
+  # zarzadzana polityka roli CodeDeploy pozwala wywolywac tylko takie funkcje.
+  PreTrafficHook:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: CodeDeployHook_workshop-app-pretraffic
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 60
+      Environment:
+        Variables:
+          NEW_VERSION_ARN: !Ref AppFunction.Version
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action: codedeploy:PutLifecycleEventHookExecutionStatus
+              Resource: "*"
+        - LambdaInvokePolicy:
+            FunctionName: !Ref AppFunction
+      InlineCode: |
+        import json
+        import os
+
+        import boto3
+
+        lam = boto3.client("lambda")
+        codedeploy = boto3.client("codedeploy")
+
+
+        def handler(event, context):
+            status = "Failed"
+            try:
+                resp = lam.invoke(
+                    FunctionName=os.environ["NEW_VERSION_ARN"],
+                    Payload=json.dumps({"rawPath": "/health"}).encode(),
+                )
+                result = json.loads(resp["Payload"].read())
+                if "FunctionError" not in resp and result.get("statusCode") == 200:
+                    status = "Succeeded"
+                print(f"Walidacja nowej wersji: {result} -> {status}")
+            except Exception as exc:  # hook musi zawsze zglosic wynik
+                print(f"Blad walidacji: {exc}")
+            codedeploy.put_lifecycle_event_hook_execution_status(
+                deploymentId=event["DeploymentId"],
+                lifecycleEventHookExecutionId=event["LifecycleEventHookExecutionId"],
+                status=status,
+            )
+
+  # HTTP API (API Gateway v2) z integracja proxy do ALIASU "live" (payload format 2.0,
+  # zgodny z event["rawPath"] uzywanym w src/app.py). Dzieki aliasowi ruch z API
+  # podlega wagom ustawianym przez CodeDeploy.
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: workshop-app-api
+      ProtocolType: HTTP
+
+  HttpApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Ref AppFunction.Alias
+      PayloadFormatVersion: "2.0"
+
+  HttpApiRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: "$default"
+      Target: !Sub "integrations/${HttpApiIntegration}"
+
+  HttpApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: "$default"
+      AutoDeploy: true
+
+  # Zezwolenie dla API Gateway na wywolywanie aliasu funkcji
+  ApiInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AppFunction.Alias
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*"
+
+Outputs:
+  ApiUrl:
+    Value: !GetAtt HttpApi.ApiEndpoint

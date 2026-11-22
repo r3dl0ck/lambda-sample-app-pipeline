@@ -1,0 +1,44 @@
+# Cwiczenie 4.2 - CodeBuild buildspec.
+# Definiuje kolejne fazy wykonywane przez CodeBuild - kazda faza to
+# zestaw komend powloki wykonywanych w izolowanym, efemerycznym srodowisku.
+version: 0.2
+
+env:
+  variables:
+    ENVIRONMENT: "dev"
+
+phases:
+  install:
+    runtime-versions:
+      python: 3.12
+    commands:
+      - echo "Instalacja zaleznosci..."
+      - pip install --upgrade pip
+      - pip install -r requirements.txt --cache-dir /root/.cache/pip
+
+  pre_build:
+    commands:
+      - echo "Uruchamiam testy jednostkowe przed budowa..."
+      - python -m pytest test_app.py -v
+
+  build:
+    commands:
+      - echo "Pakowanie aplikacji SAM/CloudFormation..."
+      - aws cloudformation package
+        --template-file template.yaml
+        --s3-bucket "$ARTIFACT_BUCKET"
+        --output-template-file packaged-template.yaml
+
+  post_build:
+    commands:
+      - echo "Build zakonczony pomyslnie o $(date)"
+
+artifacts:
+  files:
+    - packaged-template.yaml
+  discard-paths: no
+
+cache:
+  paths:
+    - "node_modules/**/*"
+    - "/root/.cache/pip/**/*"
